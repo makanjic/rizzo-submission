@@ -13,7 +13,8 @@ import inspect
 import ast
 import requests
 
-from typing import Any, Dict, List, Tuple, Optional, get_type_hints
+from copy import deepcopy
+from typing import Dict, List, Tuple, Optional, Union, get_type_hints
 from enum import Enum
 
 import logging
@@ -27,7 +28,7 @@ stream_handler.setLevel(logging.DEBUG)
 stream_handler.setFormatter(formatter)
 logger.addHandler(stream_handler)
 
-from swebase import SWEBase, Patch, Role, Response, ToolCall, \
+from swebase import SWEBase, Patch, Response, ToolCall, \
                     BaseMessage, ToolCallMessage, AssistantMessage
 
 
@@ -247,6 +248,7 @@ def list_functions_in_file(
                 - "end_line": int, end line of definition
                 - "body": str | None
     """
+    max_lines = int(max_lines) if max_lines is not None else None
     results: List[Dict[str, object]] = []
     try:
         with open(filepath, "r", encoding="utf-8") as f:
@@ -313,6 +315,7 @@ def list_files_and_functions(
             - "end_line": int, the line number where it ends
             - "body": str | None, trimmed function code if included
     """
+    max_lines = int(max_lines) if max_lines is not None else None
     result: Dict[str, List[Dict[str, object]]] = {}
     for file_path in list_python_files(directory):
         result[file_path] = list_functions_in_file(
@@ -356,6 +359,7 @@ def grep_with_limit_bash(
             - Trimmed grep output or stderr message (UTF-8 decoded).
             - Exit status code from grep.
     """
+    max_lines = int(max_lines) if max_lines is not None else None
     if exclude_dirs is None:
         exclude_dirs = EXCLUDED_DIRS
 
@@ -387,7 +391,8 @@ def grep_with_limit_bash(
 
 def extract_code_by_line_range(
     file_path: str,
-    line_range: Tuple[Optional[int], Optional[int]],
+    start_line: Optional[int] = None,
+    end_line: Optional[int] = None,
     include_body: bool = True,
     max_lines: int = 5000
 ) -> List[Dict[str, object]]:
@@ -399,75 +404,78 @@ def extract_code_by_line_range(
 
     Parameters:
         file_path (str): Path to the Python file to parse.
-        line_range (Tuple[Optional[int], Optional[int]]):
-            A tuple (start_line, end_line), both inclusive.
-            - If start_line is None, it means start of file.
-            - If end_line is None, it means end of file.
+        start_line (int, optional): Start line (1-based, inclusive). Defaults to None (start of file).
+        end_line (int, optional): End line (inclusive). Defaults to None (end of file).
         include_body (bool, optional): If True, include function/method source code.
                                        Defaults to True.
         max_lines (int, optional): Maximum number of lines to include in each body.
                                    Defaults to 5000. Only used if include_body is True.
 
     Returns:
-        List[Dict[str, object]]:
-            Each dict contains:
-                - "type": "function" | "async_function" | "global"
-                - "name": str, the function/method qualified name or global line
-                - "start_line": int, start line number
-                - "end_line": int, end line number
-                - "body": str | None (always None for globals)
+        List[Dict[str, object]]: Each dict contains:
+            - "type": "function" | "async_function" | "global"
+            - "name": str, the function/method qualified name or global line
+            - "start_line": int, start line number
+            - "end_line": int, end line number
+            - "body": str | None (always None for globals)
     """
-    start_line, end_line = line_range
-
-    with open(file_path, "r", encoding="utf-8") as f:
-        source = f.read()
-    lines = source.splitlines()
-
-    total_lines = len(lines)
-    if start_line is None:
-        start_line = 1
-    if end_line is None:
-        end_line = total_lines
-
-    tree = ast.parse(source)
-    attach_parents(tree)
+    max_lines = int(max_lines) if max_lines is not None else None
     results: List[Dict[str, object]] = []
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            source = f.read()
+        lines = source.splitlines()
 
-    # Functions and methods
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if hasattr(node, "lineno") and hasattr(node, "end_lineno"):
-                if not (node.end_lineno < start_line or node.lineno > end_line):
-                    func_body = None
-                    if include_body:
-                        func_code = "\n".join(
-                            lines[node.lineno - 1: node.end_lineno]
-                        )
-                        func_body = trim_string_by_lines(func_code, max_lines)
+        total_lines = len(lines)
+        start_line = int(start_line) if start_line is not None else 1
+        end_line = int(end_line) if end_line is not None else total_lines
 
+        tree = ast.parse(source)
+        attach_parents(tree)
+
+        # Functions and methods
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if hasattr(node, "lineno") and hasattr(node, "end_lineno"):
+                    if not (node.end_lineno < start_line or node.lineno > end_line):
+                        func_body = None
+                        if include_body:
+                            func_code = "\n".join(
+                                lines[node.lineno - 1: node.end_lineno]
+                            )
+                            func_body = trim_string_by_lines(func_code, max_lines)
+
+                        entry = {
+                            "type": "async_function" if isinstance(node, ast.AsyncFunctionDef) else "function",
+                            "name": get_qualified_name(node),
+                            "start_line": node.lineno,
+                            "end_line": node.end_lineno,
+                            "body": func_body,
+                        }
+                        results.append(entry)
+
+        # Global-level matches (outside functions)
+        for i in range(start_line, end_line + 1):
+            if i <= len(lines):
+                inside_func = any(e["start_line"] <= i <= e["end_line"] for e in results)
+                if not inside_func:
                     entry = {
-                        "type": "async_function" if isinstance(node, ast.AsyncFunctionDef) else "function",
-                        "name": get_qualified_name(node),
-                        "start_line": node.lineno,
-                        "end_line": node.end_lineno,
-                        "body": func_body,
+                        "type": "global",
+                        "name": lines[i - 1].strip(),
+                        "start_line": i,
+                        "end_line": i,
+                        "body": None
                     }
                     results.append(entry)
 
-    # Global-level matches (outside functions)
-    for i in range(start_line, end_line + 1):
-        if i <= len(lines):
-            # skip if line is inside any known function/method
-            inside_func = any(e["start_line"] <= i <= e["end_line"] for e in results)
-            if not inside_func:
-                entry = {
-                    "type": "global",
-                    "name": lines[i - 1].strip(),
-                    "start_line": i,
-                    "end_line": i,
-                    "body": None
-                }
-                results.append(entry)
+    except (SyntaxError, UnicodeDecodeError) as e:
+        results.append({
+            "type": "error",
+            "name": f"<Error parsing file: {e}>",
+            "start_line": -1,
+            "end_line": -1,
+            "body": None
+        })
 
     results.sort(key=lambda x: x["start_line"])
     return results
@@ -501,50 +509,61 @@ def extract_code_with_search_term(
                 - "end_line": int, end line number
                 - "body": str | None (globals only if include_body=True, full line included)
     """
-    with open(filename, "r", encoding="utf-8") as f:
-        source = f.read()
-    lines = source.splitlines()
-
-    if ignore_case:
-        search_cmp = search_term.lower()
-        match_in_line = lambda l: search_cmp in l.lower()
-    else:
-        match_in_line = lambda l: search_term in l
-
-    tree = ast.parse(source)
-    attach_parents(tree)
+    max_lines = int(max_lines) if max_lines is not None else None
     results: List[Dict[str, object]] = []
+    try:
+        with open(filename, "r", encoding="utf-8") as f:
+            source = f.read()
+        lines = source.splitlines()
 
-    # Functions and methods
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if hasattr(node, "lineno") and hasattr(node, "end_lineno"):
-                func_code = "\n".join(lines[node.lineno - 1: node.end_lineno])
-                if match_in_line(func_code):
-                    func_body = None
-                    if include_body:
-                        func_body = trim_string_by_lines(func_code, max_lines)
+        if ignore_case:
+            search_cmp = search_term.lower()
+            match_in_line = lambda l: search_cmp in l.lower()
+        else:
+            match_in_line = lambda l: search_term in l
 
-                    entry = {
-                        "type": "async_function" if isinstance(node, ast.AsyncFunctionDef) else "function",
-                        "name": get_qualified_name(node),
-                        "start_line": node.lineno,
-                        "end_line": node.end_lineno,
-                        "body": func_body,
-                    }
-                    results.append(entry)
+        tree = ast.parse(source)
+        attach_parents(tree)
 
-    # Global-level matches
-    for i, line in enumerate(lines, 1):
-        if match_in_line(line):
-            entry = {
-                "type": "global",
-                "name": line.strip(),
-                "start_line": i,
-                "end_line": i,
-                "body": line if include_body else None
-            }
-            results.append(entry)
+        # Functions and methods
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if hasattr(node, "lineno") and hasattr(node, "end_lineno"):
+                    func_code = "\n".join(lines[node.lineno - 1: node.end_lineno])
+                    if match_in_line(func_code):
+                        func_body = None
+                        if include_body:
+                            func_body = trim_string_by_lines(func_code, max_lines)
+
+                        entry = {
+                            "type": "async_function" if isinstance(node, ast.AsyncFunctionDef) else "function",
+                            "name": get_qualified_name(node),
+                            "start_line": node.lineno,
+                            "end_line": node.end_lineno,
+                            "body": func_body,
+                        }
+                        results.append(entry)
+
+        # Global-level matches
+        for i, line in enumerate(lines, 1):
+            if match_in_line(line):
+                entry = {
+                    "type": "global",
+                    "name": line.strip(),
+                    "start_line": i,
+                    "end_line": i,
+                    "body": line if include_body else None
+                }
+                results.append(entry)
+    
+    except (SyntaxError, UnicodeDecodeError) as e:
+        results.append({
+            "type": "error",
+            "name": f"<Error parsing file: {e}>",
+            "start_line": -1,
+            "end_line": -1,
+            "body": None
+        })
 
     results.sort(key=lambda x: x["start_line"])
     return results
@@ -570,6 +589,7 @@ def search_term_in_directory(
     Returns:
         dict[str, list[dict]]: Mapping from file path -> list of matches.
     """
+    max_lines = int(max_lines) if max_lines is not None else None
     results = {}
     for file_path in list_python_files(directory):
         matches = extract_code_with_search_term(
@@ -585,16 +605,16 @@ def search_term_in_directory(
 
 
 def finalize_test_collection(
-    file_to_tests: Dict[str, List[str]], 
+    file_to_tests: Union[str, Dict[str, List[str]]], 
     max_lines: Optional[int] = None
 ) -> Dict[str, Dict[str, str]]:
     """
     Finalize the collection of test functions by retrieving their full source bodies.
 
     Parameters:
-        file_to_tests (dict[str, list[str]]):
+        file_to_tests (dict[str, list[str]] | str):
             A dictionary mapping Python file paths to lists of test function names
-            contained in those files.
+            contained in those files. Can also be a JSON string.
 
             Example:
                 {
@@ -612,16 +632,44 @@ def finalize_test_collection(
             - Key = file path
             - Value = dictionary mapping test function names to their source code bodies.
     """
+    # Handle JSON string passed in
+    if isinstance(file_to_tests, str):
+        try:
+            file_to_tests = json.loads(file_to_tests)
+        except json.JSONDecodeError:
+            raise ValueError("file_to_tests must be a dict or a valid JSON string")
+
+    if not isinstance(file_to_tests, dict):
+        raise TypeError("file_to_tests must be a dict mapping file -> list of tests")
+
+    # Normalize values: ensure each is always a list of strings
+    normalized: Dict[str, List[str]] = {}
+    for file, tests in file_to_tests.items():
+        if isinstance(tests, str):
+            normalized[file] = [tests]
+        elif isinstance(tests, list):
+            normalized[file] = [str(t) for t in tests]
+        else:
+            raise TypeError(f"Invalid type for tests of file {file}: {type(tests)}")
+
+    # Convert max_lines if needed
+    max_lines = int(max_lines) if max_lines is not None else None
+
     results: Dict[str, Dict[str, str]] = {}
 
-    for file_path, test_names in file_to_tests.items():
+    for file_path, test_names in normalized.items():
         try:
             with open(file_path, "r", encoding="utf-8") as f:
                 source = f.read()
-            tree = ast.parse(source, filename=file_path)
-            lines = source.splitlines()
+            try:
+                tree = ast.parse(source, filename=file_path)
+            except SyntaxError as e:
+                results[file_path] = {f"<SyntaxError: {e}>": ""}
+                continue
 
+            lines = source.splitlines()
             file_results: Dict[str, str] = {}
+
             for node in ast.walk(tree):
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     if node.name in test_names and hasattr(node, "lineno") and hasattr(node, "end_lineno"):
@@ -633,10 +681,93 @@ def finalize_test_collection(
             if file_results:
                 results[file_path] = file_results
 
-        except (FileNotFoundError, SyntaxError, UnicodeDecodeError) as e:
+        except (FileNotFoundError, UnicodeDecodeError) as e:
             results[file_path] = {f"<Error reading file: {e}>": ""}
 
     return results
+
+
+def normalize_response_for_messages(response: Response) -> list[AssistantMessage]:
+    """
+    Convert a Response into a single AssistantMessage containing `content` from
+    `response.result` and `tool_calls` from `response.tool_calls`, where each
+    tool call is represented as a dictionary with `id`, `type`, and a `function`
+    mapping containing `name` and serialized `arguments`. `tool_calls` is always
+    a list (empty if none), and the message is returned even if `content` is None.
+    """
+    out = []
+
+    tool_calls_list = []
+    for tc in response.tool_calls:
+        tool_calls_list.append({
+            "id": tc.id,
+            "type": "function",
+            "function": {
+                "name": tc.name,
+                "arguments": tc.args if isinstance(tc.args, str) else json.dumps(tc.args)
+            }
+        })
+
+    out.append(AssistantMessage(
+        role="assistant",
+        content=response.result,
+        tool_calls=tool_calls_list
+    ))
+    return out
+
+
+def trim_tool_messages(
+    history: List[BaseMessage],
+    last_n: int = 5,
+    last_m: int = 5
+) -> List[BaseMessage]:
+    """
+    Trim tool messages in old message history.
+
+    Rules:
+    - Last `last_n` messages are fully preserved.
+    - In the previous `last_m` tool messages, preserve the first line and append "X line trimmed".
+    - Older tool messages before that are removed completely.
+
+    Args:
+        history: List of BaseMessage (AssistantMessage or ToolCallMessage)
+        last_n: Number of most recent messages to preserve fully
+        last_m: Number of last tool messages before last_n to partially trim
+
+    Returns:
+        List[BaseMessage]: Trimmed message history
+    """
+    # Deepcopy to avoid modifying original messages
+    trimmed_history = deepcopy(history)
+
+    # Messages to consider for trimming (exclude last_n fully preserved messages)
+    old_messages = trimmed_history[:-last_n] if last_n > 0 else trimmed_history
+
+    # Find all tool message indices in old_messages
+    tool_indices = [i for i, msg in enumerate(old_messages) if isinstance(msg, ToolCallMessage)]
+
+    # Partially trim last last_m tool messages in old_messages
+    for i in tool_indices[-last_m:]:
+        msg = old_messages[i]
+        lines = msg.content.splitlines()
+        if len(lines) > 1:
+            trimmed_lines = len(lines) - 1
+            msg.content = lines[0] + f"\n{trimmed_lines} line trimmed"
+
+    # Remove older tool messages in old_messages
+    for i in tool_indices[:-last_m]:
+        old_messages[i] = None
+
+    # Remove fully trimmed tool messages
+    old_messages = [msg for msg in old_messages if msg is not None]
+
+    # Combine with last_n fully preserved messages
+    if last_n > 0:
+        trimmed_history = old_messages + trimmed_history[-last_n:]
+    else:
+        trimmed_history = old_messages
+
+    return trimmed_history
 
 
 TEST_COLLECTION_SYSTEM_PROMPT_TEMPLATE = textwrap.dedent("""
@@ -679,10 +810,6 @@ class ResponseErrorType(Enum):
     UNKNOWN = 5
 
 
-def summarize_history(history: list[BaseMessage]) -> list[BaseMessage]:
-    return history
-
-
 class SWE(SWEBase):
     def __init__(self):
         super().__init__()
@@ -696,6 +823,7 @@ class SWE(SWEBase):
                 max_tokens=65536,
                 model=LLM_MODEL
             )
+            return response
         except Exception as e:
             error_msg = str(e)
             logger.debug(f"LLM request raises Exception {error_msg}")
@@ -725,40 +853,51 @@ class SWE(SWEBase):
             step += 1
             now_t = time.perf_counter()
             if (now_t - start_t > TIMEOUT_TEST_COLLECTION):
-                logger.debug(f"{step}. timeout occurred during test collection.")
+                logger.debug(f"test collection step {step}. timeout occurred")
                 break
 
             messages: list[BaseMessage] = [
-                BaseMessage(role=Role.SYSTEM, content=system_prompt),
-                BaseMessage(role=Role.USER, content=user_prompt)
+                BaseMessage(role="system", content=system_prompt),
+                BaseMessage(role="user", content=user_prompt)
             ]
             messages.extend(history)
 
+            # logger.debug(f"messages {messages}")
+            # logger.debug(f"tools {tools}")
             response = self.call_llm(messages, tools)
+            if response is None:
+                logger.debug(f"test collection step {step}. response is None")
+                break
             if response.tool_calls is None:
-                logger.debug(f"{step}. tool call is None.")
+                logger.debug(f"test collection step {step}. tool call is None")
                 break
 
-            history.append(AssistantMessage(
-                content=response.result,
-                tool_calls=response.tool_calls
-            ))
+            assistant_messages = normalize_response_for_messages(response)
+            history.extend(assistant_messages)
+            logger.debug(f"assistant_messages {assistant_messages}")
 
             for tc in response.tool_calls:
                 if not tc.name in tool_func_dict.keys():
                     continue
-                result = tool_func_dict[tc.name](**tc.args)
+
+                if isinstance(tc.args, str):
+                    arguments = json.loads(tc.args)
+                else:
+                    arguments = tc.args
+
+                result = tool_func_dict[tc.name](**arguments)
                 if tc.name == "finalize_test_collection":
-                    logger.debug(f"{step}. tool call is the finalization.")
+                    logger.debug(f"test collection step {step}. tool call is the finalization.")
                     logger.debug(f"{result}")
                     return result
                 history.append(ToolCallMessage(
+                    role="tool",
                     tool_call_id=tc.id,
                     name=tc.name,
-                    content=json.dumps(result)
+                    content=result if isinstance(result, str) else json.dumps(result)
                 ))
 
-            history = summarize_history(history)
+            history = trim_tool_messages(history)
 
         return None
 
