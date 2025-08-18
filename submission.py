@@ -12,6 +12,7 @@ import random
 import inspect
 import ast
 import requests
+import tempfile
 
 from copy import deepcopy
 from typing import Dict, List, Tuple, Optional, Union, get_type_hints
@@ -687,6 +688,212 @@ def finalize_test_collection(
     return results
 
 
+def replace_python_snippet(file_path, target_snippet, replacement_snippet):
+    """"
+    Replace a single occurrence of `target_snippet` with `replacement_snippet` in a Python file.
+
+    After performing the replacement, this function **verifies that the resulting file
+    still contains valid Python syntax** by parsing it with `ast.parse`.
+    If a syntax error is introduced by the replacement, the original file is not modified
+    and a specific status code is returned.
+
+    Returns:
+        (message: str, status_code: int)
+
+        Status codes:
+            0: Replacement successful and Python syntax is valid.
+            1: Target snippet not found in the file.
+            2: Target snippet appears more than once; no replacement performed.
+            3: File not found or other I/O error.
+            4: Replacement would result in invalid Python syntax; original file preserved.
+    """
+    temp_file_path = file_path + '.tmp'
+    snippet_found = False
+    buffer = ''
+    target_len = len(target_snippet)
+
+    try:
+        # Step 1: Replace snippet
+        with open(file_path, 'r', encoding='utf-8') as infile, open(temp_file_path, 'w', encoding='utf-8') as outfile:
+            for line in infile:
+                buffer += line
+
+                while len(buffer) >= target_len:
+                    idx = buffer.find(target_snippet)
+                    if idx == -1:
+                        outfile.write(buffer[:-target_len+1])
+                        buffer = buffer[-target_len+1:]
+                        break
+                    else:
+                        if snippet_found:
+                            msg = f"Target snippet appears more than once in {file_path}."
+                            logger.debug(msg)
+                            os.remove(temp_file_path)
+                            return (msg, 2)
+                        outfile.write(buffer[:idx])
+                        outfile.write(replacement_snippet)
+                        buffer = buffer[idx + target_len:]
+                        snippet_found = True
+
+            outfile.write(buffer)
+
+        if not snippet_found:
+            msg = f"Target snippet not found in {file_path}."
+            logger.debug(msg)
+            os.remove(temp_file_path)
+            return (msg, 1)
+
+        # Step 2: Check Python syntax using ast.parse
+        with open(temp_file_path, 'r', encoding='utf-8') as f:
+            file_content = f.read()
+        try:
+            ast.parse(file_content, filename=temp_file_path)
+        except SyntaxError as e:
+            msg = f"Python syntax error after replacement: {e}"
+            logger.debug(msg)
+            os.remove(temp_file_path)
+            return (msg, 4)
+
+        # Step 3: Replace original file
+        os.replace(temp_file_path, file_path)
+        msg = f"Successfully replaced the target snippet in {file_path} with valid Python syntax."
+        logger.debug(msg)
+        return (msg, 0)
+
+    except FileNotFoundError:
+        msg = f"The file {file_path} does not exist."
+        logger.debug(msg)
+        return (msg, 3)
+    except Exception as e:
+        msg = f"An I/O error occurred in {file_path}: {e}"
+        logger.debug(msg)
+        return (msg, 3)
+
+
+def run_python_code(code: str) -> tuple[str, int]:
+    """
+    Execute Python code given as a string using the system's python3 command.
+    You can use this tool directly to run any test code or bug reproduction code.
+
+    Saves code to a temporary .py file in the current working directory.
+    First, performs a syntax check using `python3 -m py_compile`.
+    If syntax is correct, runs the code.
+
+    Returns:
+        (output, returncode)
+        - If syntax check fails: output is syntax error message, returncode != 0
+        - If run succeeds: output is stdout, returncode 0
+        - If run fails: output is stderr, returncode != 0
+    """
+    # Create temporary file in current working directory
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, dir=os.getcwd()) as tmp_file:
+        tmp_file_name = tmp_file.name
+        tmp_file.write(code)
+
+    try:
+        # Syntax check
+        syntax_check = subprocess.run(
+            ["python3", "-m", "py_compile", tmp_file_name],
+            capture_output=True,
+            text=True
+        )
+        if syntax_check.returncode != 0:
+            return syntax_check.stderr, syntax_check.returncode
+
+        # Run the code
+        result = subprocess.run(
+            ["python3", tmp_file_name],
+            capture_output=True,
+            text=True
+        )
+        output = result.stdout if result.returncode == 0 else result.stderr
+        return output, result.returncode
+    finally:
+        os.remove(tmp_file_name)
+
+
+def reset_git_repository(repo_path=".", mode="hard"):
+    """
+    Reset a Git repository to HEAD.
+    This will revert any changes made to the codebase and let you start again.
+    Only use this tool when you gets conclusion that current changes you made to the codebase are not relevant and you want to start again.
+
+    Args:
+        repo_path (str): Path to the local Git repository (default: current directory).
+        mode (str): Reset mode: "soft", "mixed", or "hard" (default: "hard").
+
+    Returns:
+        (message: str, status_code: int)
+
+        Status codes:
+            0: Success
+            1: Invalid mode
+            2: Git command failed
+            3: Repository path not found
+            4: Path exists but is not a Git repository
+    """
+    if mode not in {"soft", "mixed", "hard"}:
+        msg = f"Invalid reset mode '{mode}'. Must be one of: soft, mixed, hard."
+        logger.debug(msg)
+        return (msg, 1)
+
+    if not os.path.exists(repo_path):
+        msg = f"Repository path '{repo_path}' not found."
+        logger.debug(msg)
+        return (msg, 3)
+
+    if not os.path.isdir(os.path.join(repo_path, ".git")):
+        msg = f"Path '{repo_path}' is not a Git repository."
+        logger.debug(msg)
+        return (msg, 4)
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", repo_path, "reset", f"--{mode}", "HEAD"],
+            text=True,
+            capture_output=True,
+            check=False
+        )
+
+        if result.returncode == 0:
+            msg = f"Successfully reset repository at {repo_path} to HEAD ({mode} mode)."
+            logger.debug(msg)
+            return (msg, 0)
+        else:
+            msg = f"Git reset failed: {result.stderr.strip()}"
+            logger.debug(msg)
+            return (msg, 2)
+
+    except Exception as e:
+        msg = f"An unexpected error occurred: {e}"
+        logger.debug(msg)
+        return (msg, 2)
+
+
+def finalize_produce_patches() -> Tuple[str, int]:
+    """
+    Finalization function for the product patches stage.
+    Collects the diff from the current directory using git and
+    returns it directly as a string.
+
+    Binary file diffs are excluded.
+
+    Returns:
+        Tuple[str, int]:
+            - str: The raw diff output from `git diff`, or an error message if an exception occurs.
+            - int: The git command's return status code (0 on success, non-zero on error).
+    """
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--no-binary"],
+            capture_output=True,
+            text=True
+        )
+        return result.stdout, result.returncode
+    except Exception as e:
+        return f"[error] {e}", 1
+
+
 def normalize_response_for_messages(response: Response) -> list[AssistantMessage]:
     """
     Convert a Response into a single AssistantMessage containing `content` from
@@ -794,20 +1001,43 @@ TEST_COLLECTION_USER_PROMPT_TEMPLATE = textwrap.dedent("""
 {problem_statement}
 """)
 
+PRODUCE_PATCHES_SYSTEM_PROMPT_TEMPLATE = textwrap.dedent("""
+# Hey there! You're a Coding Assistant 🚀. I have uploaded all files of a python repository. Your current working directory is at the root of that repo. You will be provided with a problem statement and the test functions that you need pass after you have fixed the issue. You need to make the necessary changes to fix the issue.
+
+## Important Rules:
+- You should focus on the test functions provided and reference the problem statement to fix the issue.
+- When you check test files, you only need to check the files mentioned in test functions, NEVER search for other test files that are not mentioned in test functions.
+
+## Follow these steps to fix the issue:
+1. As a first step, find the relevant files in the repo to work by focusing on the test functions provided and referencing the problem statement.
+2. Localise the code causing the issue.
+3. Edit the source code of the repo to resolve the issue using the replace_python_snippet tool.
+4. Think about edgecases and make sure the fix handles them as well.
+5. Code must always be backward compatible unless explicitly mentioned otherwise in the problem statement.
+6. Thoroughly check the entire code base to ensure the changes made are exhaustive and does not break any other functionality.
+7. Thoroughly check the entire code base to ensure the changes user requested are only limited to the ones you have identified.
+8. Never edit/update the existing test files.
+9. Do not create any new files or directories.
+10. You need to look at both expected output mentioned in the problem statement AND the output in the most relevant test case. This is very important.
+11. If you find that the error while running the run_code tool due to missing dependencies, do not try to solve it as you don't have any internet access.
+""")
+
+PRODUCE_PATCHES_USER_PROMPT_TEMPLATE = textwrap.dedent("""
+# Now let's start. Here are the test functions you need to pass:
+{test_func_codes}
+
+# Here is the problem statement:
+{problem_statement}
+""")
+
 
 # LLM_MODELS = ["z-ai/glm-4.5", "anthropic/claude-sonnet-4", "deepseek/deepseek-chat-v3-0324", "openai/gpt-5"]
 LLM_MODEL = "z-ai/glm-4.5"
 
 STEPS_MAX_TEST_COLLECTION = 100
 TIMEOUT_TEST_COLLECTION = 1000
-
-
-class ResponseErrorType(Enum):
-    EMPTY_RESPONSE = 1
-    RATE_LIMIT_EXCEEDED = 2
-    INVALID_RESPONSE_FORMAT = 3
-    TIMEOUT = 4
-    UNKNOWN = 5
+STEPS_MAX_PRODUCE_PATCHES = 100
+TIMEOUT_PRODUCE_PATCHES = 1000
 
 
 class SWE(SWEBase):
@@ -905,10 +1135,96 @@ class SWE(SWEBase):
         self,
         issue_description: str,
         file_test_bodies: Dict[str, Dict[str, str]]
-    ) -> Patch:
-        pass
+    ) -> Union[Patch, str]:
+        tool_func_list = [
+            grep_with_limit_bash,
+            extract_code_by_line_range,
+            extract_code_with_search_term,
+            search_term_in_directory,
+            replace_python_snippet,
+            run_python_code,
+            reset_git_repository,
+            finalize_produce_patches
+        ]
+        tool_func_dict = {k.__name__: k for k in tool_func_list}
+        tools = [tool_metadata(k) for k in tool_func_list]
 
-    def __call__(self, repo_location: str, issue_description: str) -> Patch:
-        os.chdir(repo_location)
-        file_test_bodies = self.run_test_collection(issue_description)
+        test_func_codes = ""
+        for test_file in file_test_bodies:
+            test_func_codes += f"## file: {test_file}\n"
+            for test_func in file_test_bodies[test_file]:
+                test_func_codes += f"### function: {test_func}\n"
+                test_func_codes += file_test_bodies[test_file][test_func]
+                test_func_codes += "\n"
+
+        system_prompt = PRODUCE_PATCHES_SYSTEM_PROMPT_TEMPLATE
+        user_prompt = PRODUCE_PATCHES_USER_PROMPT_TEMPLATE.format(
+            problem_statement=issue_description
+            test_func_codes=test_func_codes
+        )
+
+        history: list[BaseMessage] = []
+        step = 0
+        start_t = time.perf_counter()
+        while step < STEPS_MAX_PRODUCE_PATCHES:
+            step += 1
+            now_t = time.perf_counter()
+            if (now_t - start_t > TIMEOUT_PRODUCE_PATCHES):
+                logger.debug(f"produce patches step {step}. timeout occurred")
+                break
+
+            messages: list[BaseMessage] = [
+                BaseMessage(role="system", content=system_prompt),
+                BaseMessage(role="user", content=user_prompt)
+            ]
+            messages.extend(history)
+
+            # logger.debug(f"messages {messages}")
+            # logger.debug(f"tools {tools}")
+            response = self.call_llm(messages, tools)
+            if response is None:
+                logger.debug(f"produce patches step {step}. response is None")
+                break
+            if response.tool_calls is None:
+                logger.debug(f"produce patches step {step}. tool call is None")
+                break
+
+            assistant_messages = normalize_response_for_messages(response)
+            history.extend(assistant_messages)
+            logger.debug(f"assistant_messages {assistant_messages}")
+
+            for tc in response.tool_calls:
+                if not tc.name in tool_func_dict.keys():
+                    continue
+
+                if isinstance(tc.args, str):
+                    arguments = json.loads(tc.args)
+                else:
+                    arguments = tc.args
+
+                result = tool_func_dict[tc.name](**arguments)
+                if tc.name == "finalize_produce_patches":
+                    diff, status = result
+                    logger.debug(f"finalize_produce_patches step {step}. tool call is the finalization.")
+                    logger.debug(f"{result}")
+                    return diff if status == 0 else None
+                history.append(ToolCallMessage(
+                    role="tool",
+                    tool_call_id=tc.id,
+                    name=tc.name,
+                    content=result if isinstance(result, str) else json.dumps(result)
+                ))
+
+            history = trim_tool_messages(history)
+
         return None
+
+    def __call__(self, repo_location: str, issue_description: str) -> Union[Patch, str]:
+        os.chdir(repo_location)
+
+        file_test_bodies = self.run_test_collection(issue_description)
+        if file_test_bodies is None:
+            return None
+
+        resolve_patches = self.run_produce_patches(issue_description, file_test_bodies)
+        return resolve_patches
